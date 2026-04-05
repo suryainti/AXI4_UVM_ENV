@@ -4,6 +4,8 @@
 // - Validates BRESP / RRESP per AXI4 spec
 // - BID/RID vs AWID/ARID matching
 // - Correct burst address tracking: INCR, FIXED, WRAP
+// - Transaction cloning to prevent aliasing with monitor
+// - Out-of-order transaction support via per-ID pending queues
 // ============================================================
 
 import axi4_pkg::*;
@@ -22,6 +24,25 @@ class axi4_scoreboard extends uvm_scoreboard;
     localparam ADDR_TOP   = 32'h0000_03FC;  // Last valid word address
 
     logic [31:0] ref_mem [0:MEM_DEPTH-1];
+
+    // ----------------------------------------------------------
+    // Out-of-order: per-ID pending transaction queues
+    //
+    // AXI4 ordering rules:
+    //   - Transactions with the same ID must complete in issue order (FIFO).
+    //   - Transactions with different IDs may complete in any order (OOO).
+    //
+    // wr_pend_q / rd_pend_q : cloned transactions waiting to be processed,
+    //                          keyed by transaction ID.
+    // wr_order_q / rd_order_q: records the ID of each transaction in the
+    //                          order it was issued, so same-ID entries are
+    //                          always drained front-to-back (preserving order).
+    // ----------------------------------------------------------
+    axi4_seq_item wr_pend_q[int][$];   // pending writes  – key = AWID
+    axi4_seq_item rd_pend_q[int][$];   // pending reads   – key = ARID
+
+    int           wr_order_q[$];       // AWID issue sequence
+    int           rd_order_q[$];       // ARID issue sequence
 
     // ----------------------------------------------------------
     // Statistics
@@ -59,13 +80,67 @@ class axi4_scoreboard extends uvm_scoreboard;
 
     // ----------------------------------------------------------
     // write: Called per transaction from monitor
+    //
+    // Fix 1 – Clone: $cast(txn, item.clone()) prevents the scoreboard
+    //          from operating on a handle that the monitor may reuse or
+    //          overwrite before check_write/check_read has finished.
+    //
+    // Fix 2 – Out-of-order: push into per-ID queue rather than calling
+    //          check_write/check_read directly.  For reads, drain all
+    //          pending writes first so the reference model is up-to-date.
     // ----------------------------------------------------------
     function void write(axi4_seq_item item);
+        axi4_seq_item txn;
+        $cast(txn, item.clone());          // FIX 1: clone before any use
         total++;
-        if (item.xfer_type == AXI4_WRITE)
-            check_write(item);
-        else
-            check_read(item);
+
+        if (txn.xfer_type == AXI4_WRITE) begin
+            // FIX 2: queue by ID and drain in issue order
+            wr_pend_q[int'(txn.id)].push_back(txn);
+            wr_order_q.push_back(int'(txn.id));
+            drain_writes();
+        end else begin
+            // Flush all pending writes before checking the read so that
+            // the reference model reflects every write that completed
+            // before this read was sampled.
+            drain_writes();
+            rd_pend_q[int'(txn.id)].push_back(txn);
+            rd_order_q.push_back(int'(txn.id));
+            drain_reads();
+        end
+    endfunction
+
+    // ----------------------------------------------------------
+    // drain_writes
+    //   Walk wr_order_q front-to-back.  For each entry, pop the oldest
+    //   transaction with that ID from wr_pend_q and commit it to the
+    //   reference model.  Stop if a slot is empty (transaction has not
+    //   yet arrived – possible when called from drain_reads before the
+    //   write response is observed).
+    // ----------------------------------------------------------
+    function void drain_writes();
+        while (wr_order_q.size() > 0) begin
+            int id = wr_order_q[0];
+            if (!wr_pend_q.exists(id) || wr_pend_q[id].size() == 0)
+                break;
+            check_write(wr_pend_q[id].pop_front());
+            void'(wr_order_q.pop_front());
+        end
+    endfunction
+
+    // ----------------------------------------------------------
+    // drain_reads
+    //   Walk rd_order_q front-to-back and verify each read against the
+    //   (now up-to-date) reference model.
+    // ----------------------------------------------------------
+    function void drain_reads();
+        while (rd_order_q.size() > 0) begin
+            int id = rd_order_q[0];
+            if (!rd_pend_q.exists(id) || rd_pend_q[id].size() == 0)
+                break;
+            check_read(rd_pend_q[id].pop_front());
+            void'(rd_order_q.pop_front());
+        end
     endfunction
 
     // ----------------------------------------------------------
@@ -171,9 +246,13 @@ class axi4_scoreboard extends uvm_scoreboard;
     endfunction
 
     // ----------------------------------------------------------
-    // report_phase
+    // report_phase: drain any transactions that arrived late, then report
     // ----------------------------------------------------------
     function void report_phase(uvm_phase phase);
+        // Flush any transactions that were still pending at end-of-sim
+        drain_writes();
+        drain_reads();
+
         `uvm_info("SB", "============================================", UVM_MEDIUM)
         `uvm_info("SB", "         AXI4 SCOREBOARD SUMMARY           ", UVM_MEDIUM)
         `uvm_info("SB", "============================================", UVM_MEDIUM)
